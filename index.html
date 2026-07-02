@@ -1,0 +1,480 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>3D ASTEROID — 赤青メガネ対応</title>
+<style>
+  html, body {
+    margin: 0; padding: 0; overflow: hidden;
+    background: #000; height: 100%;
+    font-family: "Segoe UI", "Hiragino Sans", "Yu Gothic", sans-serif;
+    touch-action: none;
+  }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="cv"></canvas>
+<script>
+"use strict";
+
+/* ============================================================
+ * 3D ASTEROID
+ * 赤青（アナグリフ）3Dメガネ対応ベルトスクロールアクション
+ * 左目=赤フィルター / 右目=シアンフィルター を想定
+ * ============================================================ */
+
+const cvs = document.getElementById("cv");
+const ctx = cvs.getContext("2d");
+
+let W = 0, H = 0, DPR = 1;
+function resize() {
+  DPR = Math.min(window.devicePixelRatio || 1, 2);
+  W = window.innerWidth;
+  H = window.innerHeight;
+  cvs.width = W * DPR;
+  cvs.height = H * DPR;
+  cvs.style.width = W + "px";
+  cvs.style.height = H + "px";
+}
+window.addEventListener("resize", resize);
+resize();
+
+/* ---------- 3D 投影パラメータ ---------- */
+const Z0   = 1000;   // スクリーン面（視差ゼロ）の奥行き = 自機の位置
+const ZFAR = 9000;   // 隕石の出現距離
+const ZCUT = 520;    // これより手前に来た隕石は消滅（飛び出し演出）
+let   EYE  = 14;     // 無限遠での片目視差(px)。大きいほど立体感が強い
+
+function focal() { return H * 1.15; }
+
+// 眼 d = -1(左/赤) or +1(右/シアン)。d=0 でモノラル描画
+function proj(x, y, z, d) {
+  const f = focal();
+  const s = f / z;
+  return {
+    x: W / 2 + x * s + d * EYE * (1 - Z0 / z),
+    y: H / 2 + y * s,
+    s: s
+  };
+}
+// 自機プレーンでの移動可能範囲（ワールド座標）
+function limX() { return (W / 2) * Z0 / focal() * 0.88; }
+function limY() { return (H / 2) * Z0 / focal() * 0.80; }
+
+/* ---------- ゲーム状態 ---------- */
+const ST_TITLE = 0, ST_PLAY = 1, ST_OVER = 2;
+let state = ST_TITLE;
+let anaglyph = true;          // Gキーで2D表示に切替可能
+let paused = false;
+
+const player = { x: 0, y: 0, r: 46, lives: 3, inv: 0 };
+let meteors = [];
+let particles = [];
+let stars = [];
+let score = 0, best = +(localStorage.getItem("mr3d_best") || 0);
+let playTime = 0, spawnTimer = 0, shake = 0;
+
+const keys = {};
+window.addEventListener("keydown", e => {
+  if (["ArrowUp","ArrowDown","ArrowLeft","ArrowRight"," "].includes(e.key)) e.preventDefault();
+  keys[e.key.toLowerCase()] = true;
+  if (e.key === " ") {
+    if (state !== ST_PLAY) startGame();
+  }
+  if (e.key.toLowerCase() === "g") anaglyph = !anaglyph;
+  if (e.key.toLowerCase() === "p" && state === ST_PLAY) paused = !paused;
+  if (e.key === "+" || e.key === "=") EYE = Math.min(EYE + 2, 30);
+  if (e.key === "-") EYE = Math.max(EYE - 2, 4);
+});
+window.addEventListener("keyup", e => { keys[e.key.toLowerCase()] = false; });
+window.addEventListener("blur", () => { if (state === ST_PLAY) paused = true; });
+
+// タッチ / マウスドラッグ操作
+let pointer = null;
+cvs.addEventListener("pointerdown", e => {
+  if (state !== ST_PLAY) { startGame(); return; }
+  pointer = { x: e.clientX, y: e.clientY };
+});
+cvs.addEventListener("pointermove", e => {
+  if (pointer) pointer = { x: e.clientX, y: e.clientY };
+});
+window.addEventListener("pointerup", () => { pointer = null; });
+
+/* ---------- 初期化 ---------- */
+function initStars() {
+  stars = [];
+  for (let i = 0; i < 150; i++) {
+    stars.push({
+      x: (Math.random() - 0.5) * 2 * limX() * 6,
+      y: (Math.random() - 0.5) * 2 * limY() * 6,
+      z: Z0 + Math.random() * (ZFAR - Z0)
+    });
+  }
+}
+initStars();
+
+function startGame() {
+  state = ST_PLAY;
+  paused = false;
+  meteors = [];
+  particles = [];
+  score = 0;
+  playTime = 0;
+  spawnTimer = 0;
+  player.x = 0; player.y = limY() * 0.5;
+  player.lives = 3; player.inv = 2;
+  pointer = null;
+}
+
+function spawnMeteor() {
+  const r = 45 + Math.random() * 75;
+  const verts = [];
+  const n = 10;
+  for (let i = 0; i < n; i++) verts.push(0.72 + Math.random() * 0.42);
+  meteors.push({
+    x: (Math.random() - 0.5) * 2 * limX() * 1.05,
+    y: (Math.random() - 0.5) * 2 * limY() * 1.05,
+    z: ZFAR,
+    r, verts,
+    vx: (Math.random() - 0.5) * 120,
+    vy: (Math.random() - 0.5) * 90,
+    rot: Math.random() * Math.PI * 2,
+    vr: (Math.random() - 0.5) * 3,
+    passed: false
+  });
+}
+
+function explode(x, y, z, big) {
+  const n = big ? 30 : 16;
+  for (let i = 0; i < n; i++) {
+    const a = Math.random() * Math.PI * 2;
+    const sp = 150 + Math.random() * 450;
+    particles.push({
+      x, y, z,
+      vx: Math.cos(a) * sp,
+      vy: Math.sin(a) * sp,
+      vz: (Math.random() - 0.5) * 900,
+      life: 0.5 + Math.random() * 0.5,
+      r: 6 + Math.random() * 12
+    });
+  }
+  shake = big ? 0.5 : 0.2;
+}
+
+/* ---------- 更新 ---------- */
+function meteorSpeed() { return Math.min(1700 + playTime * 55, 4300); }
+function spawnInterval() { return Math.max(0.8 - playTime * 0.012, 0.22); }
+
+function update(dt) {
+  playTime += dt;
+  score += dt * 25;
+  if (shake > 0) shake = Math.max(0, shake - dt * 2);
+
+  // 自機操作
+  const sp = limX() * 1.6;
+  let dx = 0, dy = 0;
+  if (keys["arrowleft"]  || keys["a"]) dx -= 1;
+  if (keys["arrowright"] || keys["d"]) dx += 1;
+  if (keys["arrowup"]    || keys["w"]) dy -= 1;
+  if (keys["arrowdown"]  || keys["s"]) dy += 1;
+  player.x += dx * sp * dt;
+  player.y += dy * sp * dt;
+  if (pointer) {
+    // 画面座標→ワールド座標へ変換して追従
+    const f = focal();
+    const tx = (pointer.x - W / 2) * Z0 / f;
+    const ty = (pointer.y - H / 2) * Z0 / f;
+    player.x += (tx - player.x) * Math.min(1, dt * 10);
+    player.y += (ty - player.y) * Math.min(1, dt * 10);
+  }
+  player.x = Math.max(-limX(), Math.min(limX(), player.x));
+  player.y = Math.max(-limY(), Math.min(limY(), player.y));
+  if (player.inv > 0) player.inv -= dt;
+
+  // 隕石出現
+  spawnTimer -= dt;
+  if (spawnTimer <= 0) {
+    spawnMeteor();
+    // 時間経過で同時2個出現も
+    if (playTime > 25 && Math.random() < 0.35) spawnMeteor();
+    spawnTimer = spawnInterval();
+  }
+
+  // 隕石更新
+  const vz = meteorSpeed();
+  for (let i = meteors.length - 1; i >= 0; i--) {
+    const m = meteors[i];
+    m.z -= vz * dt;
+    m.x += m.vx * dt;
+    m.y += m.vy * dt;
+    m.rot += m.vr * dt;
+
+    // 自機プレーン通過時に衝突判定
+    if (!m.passed && m.z <= Z0 + 40) {
+      m.passed = true;
+      const dist = Math.hypot(m.x - player.x, m.y - player.y);
+      if (dist < m.r * 0.85 + player.r * 0.7) {
+        if (player.inv <= 0) {
+          player.lives--;
+          player.inv = 2;
+          explode(player.x, player.y, Z0, true);
+          if (player.lives <= 0) {
+            state = ST_OVER;
+            best = Math.max(best, Math.floor(score));
+            localStorage.setItem("mr3d_best", best);
+          }
+        }
+        explode(m.x, m.y, m.z, false);
+        meteors.splice(i, 1);
+        continue;
+      } else {
+        score += 60; // 回避ボーナス
+      }
+    }
+    if (m.z < ZCUT) meteors.splice(i, 1);
+  }
+
+  // パーティクル
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i];
+    p.life -= dt;
+    if (p.life <= 0) { particles.splice(i, 1); continue; }
+    p.x += p.vx * dt; p.y += p.vy * dt; p.z += p.vz * dt;
+  }
+
+  // 星（ゆっくり手前へ流す）
+  for (const s of stars) {
+    s.z -= vz * 0.45 * dt;
+    if (s.z < Z0 * 0.7) {
+      s.z = ZFAR;
+      s.x = (Math.random() - 0.5) * 2 * limX() * 6;
+      s.y = (Math.random() - 0.5) * 2 * limY() * 6;
+    }
+  }
+}
+
+/* ---------- 描画 ---------- */
+let gridScroll = 0;
+
+function drawScene(d, col, dt) {
+  ctx.strokeStyle = col;
+  ctx.fillStyle = col;
+
+  // --- 星 ---
+  for (const s of stars) {
+    const p = proj(s.x, s.y, s.z, d);
+    if (p.x < -20 || p.x > W + 20 || p.y < -20 || p.y > H + 20) continue;
+    const r = Math.max(0.6, 2.6 * p.s * 3);
+    ctx.globalAlpha = 0.9;
+    ctx.fillRect(p.x - r / 2, p.y - r / 2, r, r);
+  }
+
+  // --- 通路グリッド（床・天井） ---
+  const floorY = limY() * 1.28;
+  const gw = limX() * 1.35;
+  const SPACING = 700;
+  ctx.lineWidth = 1.2;
+  ctx.globalAlpha = 0.55;
+  // 横線（奥から手前へスクロール）
+  for (let i = 0; i < 14; i++) {
+    const z = Z0 + 150 + ((i * SPACING + gridScroll) % (ZFAR - Z0 - 150));
+    for (const yy of [floorY, -floorY]) {
+      const a = proj(-gw, yy, z, d);
+      const b = proj( gw, yy, z, d);
+      ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+    }
+  }
+  // 縦線（奥行き方向）
+  for (let i = -4; i <= 4; i++) {
+    const x = (i / 4) * gw;
+    for (const yy of [floorY, -floorY]) {
+      const a = proj(x, yy, Z0 + 150, d);
+      const b = proj(x, yy, ZFAR, d);
+      ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+    }
+  }
+  ctx.globalAlpha = 1;
+
+  // --- 隕石（奥から順に） ---
+  const sorted = meteors.slice().sort((a, b) => b.z - a.z);
+  for (const m of sorted) {
+    const p = proj(m.x, m.y, m.z, d);
+    const pr = m.r * p.s;
+    if (pr < 1.2) continue;
+    ctx.beginPath();
+    const n = m.verts.length;
+    for (let i = 0; i < n; i++) {
+      const a = m.rot + (i / n) * Math.PI * 2;
+      const rr = pr * m.verts[i];
+      const vx = p.x + Math.cos(a) * rr;
+      const vy = p.y + Math.sin(a) * rr;
+      i === 0 ? ctx.moveTo(vx, vy) : ctx.lineTo(vx, vy);
+    }
+    ctx.closePath();
+    ctx.globalAlpha = 0.5;
+    ctx.fill();
+    ctx.globalAlpha = 1;
+    ctx.lineWidth = Math.max(1.5, pr * 0.06);
+    ctx.stroke();
+    // クレーター
+    ctx.globalAlpha = 0.35;
+    ctx.beginPath();
+    ctx.arc(p.x - pr * 0.3, p.y - pr * 0.2, pr * 0.22, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(p.x + pr * 0.32, p.y + pr * 0.28, pr * 0.14, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+
+  // --- パーティクル ---
+  for (const pt of particles) {
+    const p = proj(pt.x, pt.y, pt.z, d);
+    const r = Math.max(1, pt.r * p.s * pt.life * 2);
+    ctx.globalAlpha = Math.min(1, pt.life * 2);
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, r, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+
+  // --- 自機 ---
+  if (state === ST_PLAY || state === ST_OVER) {
+    if (state === ST_OVER) return; // 撃墜済み
+    if (player.inv > 0 && Math.floor(player.inv * 10) % 2 === 0) return; // 無敵点滅
+    const p = proj(player.x, player.y, Z0, d);
+    const s = player.r * p.s;
+    ctx.lineWidth = 2.5;
+    ctx.beginPath();
+    // 後方から見た機体：中央ボディ + 両翼
+    ctx.moveTo(p.x, p.y - s * 0.9);           // 機首(上)
+    ctx.lineTo(p.x + s * 0.35, p.y + s * 0.15);
+    ctx.lineTo(p.x + s * 1.15, p.y + s * 0.55); // 右翼端
+    ctx.lineTo(p.x + s * 0.45, p.y + s * 0.6);
+    ctx.lineTo(p.x + s * 0.25, p.y + s * 0.95);
+    ctx.lineTo(p.x - s * 0.25, p.y + s * 0.95);
+    ctx.lineTo(p.x - s * 0.45, p.y + s * 0.6);
+    ctx.lineTo(p.x - s * 1.15, p.y + s * 0.55); // 左翼端
+    ctx.lineTo(p.x - s * 0.35, p.y + s * 0.15);
+    ctx.closePath();
+    ctx.globalAlpha = 0.45;
+    ctx.fill();
+    ctx.globalAlpha = 1;
+    ctx.stroke();
+    // コックピット
+    ctx.beginPath();
+    ctx.arc(p.x, p.y - s * 0.2, s * 0.18, 0, Math.PI * 2);
+    ctx.stroke();
+    // エンジン炎（ちらつき）
+    const fl = 0.6 + Math.random() * 0.5;
+    ctx.globalAlpha = 0.8;
+    ctx.beginPath();
+    ctx.moveTo(p.x - s * 0.18, p.y + s * 0.95);
+    ctx.lineTo(p.x, p.y + s * (0.95 + 0.5 * fl));
+    ctx.lineTo(p.x + s * 0.18, p.y + s * 0.95);
+    ctx.closePath();
+    ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+}
+
+function drawHUD() {
+  ctx.fillStyle = "#ccc";
+  ctx.strokeStyle = "#ccc";
+  ctx.textBaseline = "top";
+
+  if (state === ST_PLAY) {
+    ctx.font = "bold 22px monospace";
+    ctx.textAlign = "left";
+    ctx.fillText("SCORE " + Math.floor(score), 18, 14);
+    ctx.font = "16px monospace";
+    ctx.fillText("BEST  " + best, 18, 42);
+    // 残機
+    ctx.textAlign = "right";
+    for (let i = 0; i < player.lives; i++) {
+      const x = W - 24 - i * 30, y = 20;
+      ctx.beginPath();
+      ctx.moveTo(x, y); ctx.lineTo(x + 9, y + 18); ctx.lineTo(x - 9, y + 18);
+      ctx.closePath();
+      ctx.fill();
+    }
+    ctx.font = "13px monospace";
+    ctx.globalAlpha = 0.6;
+    ctx.fillText("G:2D切替  +/-:立体感  P:一時停止", W - 18, 50);
+    ctx.globalAlpha = 1;
+
+    if (paused) {
+      centerText("PAUSE", 48, -20);
+      centerText("Pキーで再開", 18, 30);
+    }
+  } else if (state === ST_TITLE) {
+    centerText("3D ASTEROID", 54, -130);
+    ctx.font = "17px sans-serif";
+    ctx.textAlign = "center";
+    ctx.globalAlpha = 0.9;
+    const lines = [
+      "🕶 赤青3Dメガネを装着してください（左目=赤 / 右目=青）",
+      "",
+      "画面の奥から迫りくる隕石を避け続けろ！",
+      "",
+      "操作: 矢印キー / WASD / ドラッグ",
+      "G: 3D⇔2D切替　＋/−: 立体感の調整",
+    ];
+    lines.forEach((t, i) => ctx.fillText(t, W / 2, H / 2 - 55 + i * 30));
+    ctx.globalAlpha = 1;
+    if (Math.floor(performance.now() / 600) % 2 === 0)
+      centerText("― スペースキー または クリックでスタート ―", 22, 160);
+  } else if (state === ST_OVER) {
+    centerText("GAME OVER", 54, -80);
+    centerText("SCORE  " + Math.floor(score), 30, -10);
+    if (Math.floor(score) >= best) centerText("★ ベスト記録更新！ ★", 20, 30);
+    else centerText("BEST  " + best, 20, 30);
+    if (Math.floor(performance.now() / 600) % 2 === 0)
+      centerText("スペースキーでリトライ", 20, 90);
+  }
+}
+
+function centerText(t, size, dy) {
+  ctx.font = "bold " + size + "px sans-serif";
+  ctx.textAlign = "center";
+  ctx.fillText(t, W / 2, H / 2 + dy);
+}
+
+/* ---------- メインループ ---------- */
+let last = performance.now();
+function frame(now) {
+  const dt = Math.min((now - last) / 1000, 0.05);
+  last = now;
+
+  if (state === ST_PLAY && !paused) update(dt);
+  if (state !== ST_PLAY || !paused) gridScroll += meteorSpeed() * 0.6 * dt * (state === ST_PLAY ? 1 : 0.3);
+
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  ctx.fillStyle = "#000";
+  ctx.fillRect(0, 0, W, H);
+
+  // 画面揺れ
+  if (shake > 0) {
+    ctx.translate((Math.random() - 0.5) * shake * 24, (Math.random() - 0.5) * shake * 24);
+  }
+
+  if (anaglyph) {
+    ctx.globalCompositeOperation = "lighter";
+    drawScene(-1, "#ff0000", dt); // 左目 = 赤
+    drawScene( 1, "#00ffff", dt); // 右目 = シアン
+    ctx.globalCompositeOperation = "source-over";
+  } else {
+    drawScene(0, "#e8e8e8", dt);
+  }
+
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  drawHUD();
+
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
