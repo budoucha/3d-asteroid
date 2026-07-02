@@ -129,7 +129,7 @@ function startGame() {
 }
 
 function spawnMeteor() {
-  const r = 45 + Math.random() * 75;
+  const r = 25 + Math.random() * 105;
   const verts = [];
   const n = 10;
   for (let i = 0; i < n; i++) verts.push(0.72 + Math.random() * 0.42);
@@ -138,6 +138,7 @@ function spawnMeteor() {
     y: (Math.random() - 0.5) * 2 * limY() * 1.05,
     z: ZFAR,
     r, verts,
+    vzMul: 0.6 + Math.random(),   // 個体ごとの速度ばらつき(0.6〜1.6倍)
     vx: (Math.random() - 0.5) * 120,
     vy: (Math.random() - 0.5) * 90,
     rot: Math.random() * Math.PI * 2,
@@ -165,15 +166,15 @@ function explode(x, y, z, big) {
 
 /* ---------- 更新 ---------- */
 function meteorSpeed() { return Math.min(1700 + playTime * 55, 4300); }
-function spawnInterval() { return Math.max(0.8 - playTime * 0.012, 0.22); }
+function spawnInterval() { return Math.max(0.5 - playTime * 0.010, 0.15); }
 
 function update(dt) {
   playTime += dt;
   score += dt * 25;
   if (shake > 0) shake = Math.max(0, shake - dt * 2);
 
-  // 自機操作
-  const sp = limX() * 1.6;
+  // 自機操作（Shiftで低速・精密移動）
+  const sp = limX() * 1.6 * (keys["shift"] ? 0.35 : 1);
   let dx = 0, dy = 0;
   if (keys["arrowleft"]  || keys["a"]) dx -= 1;
   if (keys["arrowright"] || keys["d"]) dx += 1;
@@ -197,8 +198,8 @@ function update(dt) {
   spawnTimer -= dt;
   if (spawnTimer <= 0) {
     spawnMeteor();
-    // 時間経過で同時2個出現も
-    if (playTime > 25 && Math.random() < 0.35) spawnMeteor();
+    // 時間経過で同時出現の確率が上がる
+    if (Math.random() < Math.min(0.2 + playTime * 0.012, 0.6)) spawnMeteor();
     spawnTimer = spawnInterval();
   }
 
@@ -206,7 +207,7 @@ function update(dt) {
   const vz = meteorSpeed();
   for (let i = meteors.length - 1; i >= 0; i--) {
     const m = meteors[i];
-    m.z -= vz * dt;
+    m.z -= vz * m.vzMul * dt;
     m.x += m.vx * dt;
     m.y += m.vy * dt;
     m.rot += m.vr * dt;
@@ -275,11 +276,12 @@ function drawScene(d, col, dt) {
   const floorY = limY() * 1.28;
   const gw = limX() * 1.35;
   const SPACING = 700;
+  const GRID_LEN = SPACING * 12;
   ctx.lineWidth = 1.2;
   ctx.globalAlpha = 0.55;
   // 横線（奥から手前へスクロール）
-  for (let i = 0; i < 14; i++) {
-    const z = Z0 + 150 + ((i * SPACING + gridScroll) % (ZFAR - Z0 - 150));
+  for (let i = 0; i < 12; i++) {
+    const z = Z0 + 150 + (((i * SPACING - gridScroll) % GRID_LEN) + GRID_LEN) % GRID_LEN;
     for (const yy of [floorY, -floorY]) {
       const a = proj(-gw, yy, z, d);
       const b = proj( gw, yy, z, d);
@@ -344,39 +346,63 @@ function drawScene(d, col, dt) {
   if (state === ST_PLAY || state === ST_OVER) {
     if (state === ST_OVER) return; // 撃墜済み
     if (player.inv > 0 && Math.floor(player.inv * 10) % 2 === 0) return; // 無敵点滅
-    const p = proj(player.x, player.y, Z0, d);
-    const s = player.r * p.s;
+    // 機体を3D座標で定義して投影（機首が奥＝画面奥へ向かって飛んでいる）
+    const sr = player.r;
+    const P = (mx, my, mz) => proj(player.x + mx * sr, player.y + my * sr, Z0 + mz * sr, d);
+    const nose  = P(0, -0.05, 5.0);        // 機首（一番奥）
+    const midR  = P( 0.45,  0.05, 1.0);
+    const midL  = P(-0.45,  0.05, 1.0);
+    const tipR  = P( 1.5,   0.4, -0.5);    // 翼端（手前）
+    const tipL  = P(-1.5,   0.4, -0.5);
+    const rearR = P( 0.4,   0.35, -0.6);
+    const rearL = P(-0.4,   0.35, -0.6);
+    const tailB = P(0,      0.5, -0.6);    // 尾部下端
     ctx.lineWidth = 2.5;
     ctx.beginPath();
-    // 後方から見た機体：中央ボディ + 両翼
-    ctx.moveTo(p.x, p.y - s * 0.9);           // 機首(上)
-    ctx.lineTo(p.x + s * 0.35, p.y + s * 0.15);
-    ctx.lineTo(p.x + s * 1.15, p.y + s * 0.55); // 右翼端
-    ctx.lineTo(p.x + s * 0.45, p.y + s * 0.6);
-    ctx.lineTo(p.x + s * 0.25, p.y + s * 0.95);
-    ctx.lineTo(p.x - s * 0.25, p.y + s * 0.95);
-    ctx.lineTo(p.x - s * 0.45, p.y + s * 0.6);
-    ctx.lineTo(p.x - s * 1.15, p.y + s * 0.55); // 左翼端
-    ctx.lineTo(p.x - s * 0.35, p.y + s * 0.15);
+    ctx.moveTo(nose.x, nose.y);
+    ctx.lineTo(midR.x, midR.y);
+    ctx.lineTo(tipR.x, tipR.y);
+    ctx.lineTo(rearR.x, rearR.y);
+    ctx.lineTo(tailB.x, tailB.y);
+    ctx.lineTo(rearL.x, rearL.y);
+    ctx.lineTo(tipL.x, tipL.y);
+    ctx.lineTo(midL.x, midL.y);
     ctx.closePath();
     ctx.globalAlpha = 0.45;
     ctx.fill();
     ctx.globalAlpha = 1;
     ctx.stroke();
-    // コックピット
+    // 機首への稜線（奥行きを強調）
+    ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.moveTo(nose.x, nose.y); ctx.lineTo(tailB.x, tailB.y); ctx.stroke();
+    // 垂直尾翼
+    const finT = P(0, -0.85, -0.3);
+    const finF = P(0, -0.05, 1.2);
+    const finB = P(0,  0.2, -0.6);
     ctx.beginPath();
-    ctx.arc(p.x, p.y - s * 0.2, s * 0.18, 0, Math.PI * 2);
-    ctx.stroke();
-    // エンジン炎（ちらつき）
-    const fl = 0.6 + Math.random() * 0.5;
-    ctx.globalAlpha = 0.8;
-    ctx.beginPath();
-    ctx.moveTo(p.x - s * 0.18, p.y + s * 0.95);
-    ctx.lineTo(p.x, p.y + s * (0.95 + 0.5 * fl));
-    ctx.lineTo(p.x + s * 0.18, p.y + s * 0.95);
+    ctx.moveTo(finF.x, finF.y); ctx.lineTo(finT.x, finT.y); ctx.lineTo(finB.x, finB.y);
     ctx.closePath();
-    ctx.fill();
-    ctx.globalAlpha = 1;
+    ctx.globalAlpha = 0.3; ctx.fill(); ctx.globalAlpha = 1;
+    ctx.stroke();
+    // エンジンノズル（手前側＝こちらを向いている）と炎
+    const fl = 0.6 + Math.random() * 0.5;
+    for (const ex of [-0.22, 0.22]) {
+      const e = P(ex, 0.32, -0.6);
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(e.x, e.y, 0.15 * sr * e.s, 0, Math.PI * 2);
+      ctx.stroke();
+      // 炎は視点側（手前）へ伸びる
+      const t  = P(ex, 0.36, -0.6 - 1.6 * fl);
+      const e1 = P(ex - 0.1, 0.32, -0.6);
+      const e2 = P(ex + 0.1, 0.32, -0.6);
+      ctx.globalAlpha = 0.75;
+      ctx.beginPath();
+      ctx.moveTo(e1.x, e1.y); ctx.lineTo(t.x, t.y); ctx.lineTo(e2.x, e2.y);
+      ctx.closePath();
+      ctx.fill();
+      ctx.globalAlpha = 1;
+    }
   }
 }
 
@@ -402,7 +428,7 @@ function drawHUD() {
     }
     ctx.font = "13px monospace";
     ctx.globalAlpha = 0.6;
-    ctx.fillText("G:2D切替  +/-:立体感  P:一時停止", W - 18, 50);
+    ctx.fillText("Shift:低速  G:2D切替  +/-:立体感  P:一時停止", W - 18, 50);
     ctx.globalAlpha = 1;
 
     if (paused) {
@@ -419,7 +445,7 @@ function drawHUD() {
       "",
       "画面の奥から迫りくる隕石を避け続けろ！",
       "",
-      "操作: 矢印キー / WASD / ドラッグ",
+      "操作: 矢印キー / WASD / ドラッグ　Shift: 低速移動",
       "G: 3D⇔2D切替　＋/−: 立体感の調整",
     ];
     lines.forEach((t, i) => ctx.fillText(t, W / 2, H / 2 - 55 + i * 30));
