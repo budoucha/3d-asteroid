@@ -69,12 +69,17 @@ let state = ST_TITLE;
 let anaglyph = true;          // Gキーで2D表示に切替可能
 let paused = false;
 
-const player = { x: 0, y: 0, r: 46, lives: 3, inv: 0 };
+const player = { x: 0, y: 0, r: 46, lives: 3, inv: 0, leanX: 0, leanY: 0, trail: [] };
 let meteors = [];
 let particles = [];
 let stars = [];
 let score = 0, best = +(localStorage.getItem("mr3d_best") || 0);
 let playTime = 0, spawnTimer = 0, shake = 0;
+let boost = 1;                 // 加速入力の演出・報酬倍率（1=通常、Zキーで上昇）
+const BOOST_MAX = 2.2;         // 加速時の最大倍率
+const STAR_STREAK_Z_MAX = 700; // 星の残像が奥側へ伸びる最大z距離
+const STAR_STREAK_TIME = 0.085;// 残像距離を速度へ読み替える見かけの時間幅
+let worldMul = 1;              // 隕石接近・グリッド流れ専用の倍率
 
 const keys = {};
 window.addEventListener("keydown", e => {
@@ -125,6 +130,8 @@ function startGame() {
   spawnTimer = 0;
   player.x = 0; player.y = limY() * 0.5;
   player.lives = 3; player.inv = 2;
+  player.leanX = 0; player.leanY = 0; player.trail = [];
+  boost = 1; worldMul = 1;
   pointer = null;
 }
 
@@ -139,8 +146,8 @@ function spawnMeteor() {
     z: ZFAR,
     r, verts,
     vzMul: 0.6 + Math.random(),   // 個体ごとの速度ばらつき(0.6〜1.6倍)
-    vx: (Math.random() - 0.5) * 120,
-    vy: (Math.random() - 0.5) * 90,
+    vx: (Math.random() - 0.5) * 2 * 160,   // 上下左右方向の初速（横）
+    vy: (Math.random() - 0.5) * 2 * 130,   // 同（縦）
     rot: Math.random() * Math.PI * 2,
     vr: (Math.random() - 0.5) * 3,
     passed: false
@@ -164,17 +171,62 @@ function explode(x, y, z, big) {
   shake = big ? 0.5 : 0.2;
 }
 
+// 隕石同士がぶつかった時の小さな火花
+function collideBurst(x, y, z) {
+  const n = 5 + (Math.random() * 3 | 0);
+  for (let i = 0; i < n; i++) {
+    const a = Math.random() * Math.PI * 2;
+    const sp = 120 + Math.random() * 260;
+    particles.push({
+      x, y, z,
+      vx: Math.cos(a) * sp,
+      vy: Math.sin(a) * sp,
+      vz: (Math.random() - 0.5) * 500,
+      life: 0.3 + Math.random() * 0.3,
+      r: 4 + Math.random() * 7
+    });
+  }
+}
+
 /* ---------- 更新 ---------- */
 function meteorSpeed() { return Math.min(1700 + playTime * 55, 4300); }
 function spawnInterval() { return Math.max(0.5 - playTime * 0.010, 0.15); }
+function boostAmount() { return (boost - 1) / (BOOST_MAX - 1); }
+function targetWorldMul(vz) {
+  const trailImpliedSpeed = STAR_STREAK_Z_MAX / STAR_STREAK_TIME;
+  return 1 + boostAmount() * (trailImpliedSpeed / vz);
+}
+
+// 機体ローカル座標 → ワールド座標（バンク・ピッチの傾きを反映）
+// 描画と軌跡記録で共通に使い、翼端位置のズレを防ぐ
+function shipPt(mx, my, mz) {
+  const bank = player.leanX * 0.5, pitch = player.leanY * 0.18;
+  const cb = Math.cos(bank), sb = Math.sin(bank);
+  const sr = player.r;
+  return {
+    x: player.x + (mx * cb - my * sb) * sr,
+    y: player.y + (mx * sb + my * cb + pitch * mz) * sr,
+    z: Z0 + mz * sr
+  };
+}
 
 function update(dt) {
   playTime += dt;
-  score += dt * 25;
+  // 加速（ブースト）: Zキー押下で速度・出現・得点率が上昇（衝突リスクと引き換え）
+  const boostTarget = keys["z"] ? BOOST_MAX : 1;
+  boost += (boostTarget - boost) * Math.min(1, dt * 6);
+  const vz = meteorSpeed();
+  // 星の残像距離が暗示する速度に、隕石接近・グリッド流れを合わせる
+  const worldMulTarget = keys["z"] ? targetWorldMul(vz) : 1;
+  const worldEase = worldMulTarget > worldMul ? 10 : 6;
+  worldMul += (worldMulTarget - worldMul) * Math.min(1, dt * worldEase);
+  score += dt * 25 * boost;
   if (shake > 0) shake = Math.max(0, shake - dt * 2);
 
   // 自機操作（Shiftで低速・精密移動）
-  const sp = limX() * 1.6 * (keys["shift"] ? 0.35 : 1);
+  const maxSp = limX() * 1.6;
+  const sp = maxSp * (keys["shift"] ? 0.35 : 1);
+  const px0 = player.x, py0 = player.y;
   let dx = 0, dy = 0;
   if (keys["arrowleft"]  || keys["a"]) dx -= 1;
   if (keys["arrowright"] || keys["d"]) dx += 1;
@@ -194,8 +246,26 @@ function update(dt) {
   player.y = Math.max(-limY(), Math.min(limY(), player.y));
   if (player.inv > 0) player.inv -= dt;
 
-  // 隕石出現
-  spawnTimer -= dt;
+  // 移動方向に応じた機体の傾き（実移動速度から算出）
+  const clamp1 = v => Math.max(-1, Math.min(1, v));
+  const tgtLeanX = clamp1((player.x - px0) / dt / maxSp);
+  const tgtLeanY = clamp1((player.y - py0) / dt / maxSp);
+  player.leanX += (tgtLeanX - player.leanX) * Math.min(1, dt * 8);
+  player.leanY += (tgtLeanY - player.leanY) * Math.min(1, dt * 8);
+
+  // 既存の軌跡点を機体後方（視点側）へ流す → 静止時も後ろへ尾を引く
+  // 加速中は速く流れ、より遠くまで＝軌跡が長く伸びる
+  const bAmt = boostAmount();
+  const trailCut = Z0 - (320 + bAmt * 600);
+  for (const t of player.trail) t.z -= 800 * boost * dt;
+  while (player.trail.length && player.trail[0].z < trailCut) player.trail.shift();
+  // 傾きを反映した翼端の現在位置を記録（起点が常に翼端と一致する）
+  const tipL = shipPt(-1.5, 0.4, -0.5), tipR = shipPt(1.5, 0.4, -0.5);
+  player.trail.push({ lx: tipL.x, ly: tipL.y, rx: tipR.x, ry: tipR.y, z: tipL.z });
+  if (player.trail.length > 36) player.trail.shift();
+
+  // 隕石出現（加速中は出現も速まる＝密度増でリスク上昇）
+  spawnTimer -= dt * boost;
   if (spawnTimer <= 0) {
     spawnMeteor();
     // 時間経過で同時出現の確率が上がる
@@ -204,10 +274,37 @@ function update(dt) {
   }
 
   // 隕石更新
-  const vz = meteorSpeed();
+
+  // 隕石同士の衝突（等質量の弾性跳ね返り＋火花）
+  for (let i = 0; i < meteors.length; i++) {
+    for (let j = i + 1; j < meteors.length; j++) {
+      const a = meteors[i], b = meteors[j];
+      const dx = b.x - a.x, dy = b.y - a.y, dz = b.z - a.z;
+      const rs = a.r + b.r;
+      const d2 = dx * dx + dy * dy + dz * dz;
+      if (d2 >= rs * rs || d2 < 1e-6) continue;
+      const d = Math.sqrt(d2);
+      const nx = dx / d, ny = dy / d, nz = dz / d;
+      // z成分の速度は全体速度×vzMul（視点方向へ負）
+      const avz = -vz * a.vzMul, bvz = -vz * b.vzMul;
+      const rel = (b.vx - a.vx) * nx + (b.vy - a.vy) * ny + (bvz - avz) * nz;
+      if (rel < 0) {   // 接近中のみ反発
+        a.vx += rel * nx; a.vy += rel * ny;
+        b.vx -= rel * nx; b.vy -= rel * ny;
+        a.vzMul = Math.max(0.2, Math.min(2.4, -(avz + rel * nz) / vz));
+        b.vzMul = Math.max(0.2, Math.min(2.4, -(bvz - rel * nz) / vz));
+        collideBurst((a.x + b.x) / 2, (a.y + b.y) / 2, (a.z + b.z) / 2);
+      }
+      // めり込み解消（互いに押し離す）
+      const push = (rs - d) / 2;
+      a.x -= nx * push; a.y -= ny * push; a.z -= nz * push;
+      b.x += nx * push; b.y += ny * push; b.z += nz * push;
+    }
+  }
+
   for (let i = meteors.length - 1; i >= 0; i--) {
     const m = meteors[i];
-    m.z -= vz * m.vzMul * dt;
+    m.z -= vz * m.vzMul * worldMul * dt;
     m.x += m.vx * dt;
     m.y += m.vy * dt;
     m.rot += m.vr * dt;
@@ -231,7 +328,7 @@ function update(dt) {
         meteors.splice(i, 1);
         continue;
       } else {
-        score += 60; // 回避ボーナス
+        score += 60 * boost; // 回避ボーナス（加速中は増）
       }
     }
     if (m.z < ZCUT) meteors.splice(i, 1);
@@ -247,7 +344,7 @@ function update(dt) {
 
   // 星（ゆっくり手前へ流す）
   for (const s of stars) {
-    s.z -= vz * 0.45 * dt;
+    s.z -= vz * 0.45 * boost * dt;
     if (s.z < Z0 * 0.7) {
       s.z = ZFAR;
       s.x = (Math.random() - 0.5) * 2 * limX() * 6;
@@ -263,14 +360,26 @@ function drawScene(d, col, dt) {
   ctx.strokeStyle = col;
   ctx.fillStyle = col;
 
-  // --- 星 ---
+  // --- 星（加速中は残像的な軌跡を引く） ---
+  const starStreakZ = boostAmount() * STAR_STREAK_Z_MAX;
   for (const s of stars) {
     const p = proj(s.x, s.y, s.z, d);
     if (p.x < -20 || p.x > W + 20 || p.y < -20 || p.y > H + 20) continue;
     const r = Math.max(0.6, 2.6 * p.s * 3);
-    ctx.globalAlpha = 0.9;
-    ctx.fillRect(p.x - r / 2, p.y - r / 2, r, r);
+    if (starStreakZ > 1) {
+      // 星が来た方向（奥側）へ尾を引く＝ワープ的な流れ
+      const pb = proj(s.x, s.y, s.z + starStreakZ, d);
+      ctx.globalAlpha = 0.6;
+      ctx.lineWidth = Math.max(0.8, r * 0.8);
+      ctx.beginPath();
+      ctx.moveTo(p.x, p.y); ctx.lineTo(pb.x, pb.y);
+      ctx.stroke();
+    } else {
+      ctx.globalAlpha = 0.9;
+      ctx.fillRect(p.x - r / 2, p.y - r / 2, r, r);
+    }
   }
+  ctx.globalAlpha = 1;
 
   // --- 通路グリッド（床・天井） ---
   const floorY = limY() * 1.28;
@@ -320,14 +429,19 @@ function drawScene(d, col, dt) {
     ctx.globalAlpha = 1;
     ctx.lineWidth = Math.max(1.5, pr * 0.06);
     ctx.stroke();
-    // クレーター
-    ctx.globalAlpha = 0.35;
-    ctx.beginPath();
-    ctx.arc(p.x - pr * 0.3, p.y - pr * 0.2, pr * 0.22, 0, Math.PI * 2);
-    ctx.stroke();
-    ctx.beginPath();
-    ctx.arc(p.x + pr * 0.32, p.y + pr * 0.28, pr * 0.14, 0, Math.PI * 2);
-    ctx.stroke();
+    // クレーター（隕石表面より手前に浮かせて立体的に見せる）
+    // 飛び出しは見かけサイズ(pr)に比例：遠い隕石ではごく僅か、近いほど強い。
+    // 画面面（自機）より手前へ出ることも許容し、上限は視差の融合限界（ゴースト防止）だけ。
+    ctx.globalAlpha = 0.4;
+    const popMag = Math.min(pr * 0.11, 6);   // 6 = 片眼あたりの飛び出し上限(px)
+    const popDX = -d * popMag;
+    const ca = Math.cos(m.rot), sa = Math.sin(m.rot);
+    for (const c of [[-0.3, -0.2, 0.22], [0.32, 0.28, 0.14], [0.05, -0.35, 0.10]]) {
+      const rx = c[0] * ca - c[1] * sa, ry = c[0] * sa + c[1] * ca;
+      ctx.beginPath();
+      ctx.arc(p.x + rx * pr + popDX, p.y + ry * pr, pr * c[2], 0, Math.PI * 2);
+      ctx.stroke();
+    }
     ctx.globalAlpha = 1;
   }
 
@@ -342,13 +456,32 @@ function drawScene(d, col, dt) {
   }
   ctx.globalAlpha = 1;
 
+  // --- 自機の軌跡（翼端から伸びる半透明ライン） ---
+  if (state === ST_PLAY && player.trail.length > 1) {
+    const tr = player.trail;
+    for (const side of ["l", "r"]) {
+      for (let i = 1; i < tr.length; i++) {
+        const a = tr[i - 1], b = tr[i];
+        const frac = i / tr.length;                 // 新しい区間ほど濃く太く
+        const p0 = proj(side === "l" ? a.lx : a.rx, side === "l" ? a.ly : a.ry, a.z, d);
+        const p1 = proj(side === "l" ? b.lx : b.rx, side === "l" ? b.ly : b.ry, b.z, d);
+        ctx.globalAlpha = 0.5 * frac;
+        ctx.lineWidth = 1.5 + 5.5 * frac;
+        ctx.beginPath();
+        ctx.moveTo(p0.x, p0.y); ctx.lineTo(p1.x, p1.y);
+        ctx.stroke();
+      }
+    }
+    ctx.globalAlpha = 1;
+  }
+
   // --- 自機 ---
   if (state === ST_PLAY || state === ST_OVER) {
     if (state === ST_OVER) return; // 撃墜済み
     if (player.inv > 0 && Math.floor(player.inv * 10) % 2 === 0) return; // 無敵点滅
     // 機体を3D座標で定義して投影（機首が奥＝画面奥へ向かって飛んでいる）
     const sr = player.r;
-    const P = (mx, my, mz) => proj(player.x + mx * sr, player.y + my * sr, Z0 + mz * sr, d);
+    const P = (mx, my, mz) => { const w = shipPt(mx, my, mz); return proj(w.x, w.y, w.z, d); };
     const nose  = P(0, -0.05, 5.0);        // 機首（一番奥）
     const midR  = P( 0.45,  0.05, 1.0);
     const midL  = P(-0.45,  0.05, 1.0);
@@ -385,7 +518,11 @@ function drawScene(d, col, dt) {
     ctx.globalAlpha = 0.3; ctx.fill(); ctx.globalAlpha = 1;
     ctx.stroke();
     // エンジンノズル（手前側＝こちらを向いている）と炎
+    // 加速中は噴射が長く・太くなる
+    const bAmt = boostAmount();
     const fl = 0.6 + Math.random() * 0.5;
+    const flameLen = 1.6 * fl * (1 + bAmt * 1.8);
+    const flameW = 0.1 * (1 + bAmt * 0.8);
     for (const ex of [-0.22, 0.22]) {
       const e = P(ex, 0.32, -0.6);
       ctx.lineWidth = 2;
@@ -393,9 +530,9 @@ function drawScene(d, col, dt) {
       ctx.arc(e.x, e.y, 0.15 * sr * e.s, 0, Math.PI * 2);
       ctx.stroke();
       // 炎は視点側（手前）へ伸びる
-      const t  = P(ex, 0.36, -0.6 - 1.6 * fl);
-      const e1 = P(ex - 0.1, 0.32, -0.6);
-      const e2 = P(ex + 0.1, 0.32, -0.6);
+      const t  = P(ex, 0.36, -0.6 - flameLen);
+      const e1 = P(ex - flameW, 0.32, -0.6);
+      const e2 = P(ex + flameW, 0.32, -0.6);
       ctx.globalAlpha = 0.75;
       ctx.beginPath();
       ctx.moveTo(e1.x, e1.y); ctx.lineTo(t.x, t.y); ctx.lineTo(e2.x, e2.y);
@@ -417,6 +554,9 @@ function drawHUD() {
     ctx.fillText("SCORE " + Math.floor(score), 18, 14);
     ctx.font = "16px monospace";
     ctx.fillText("BEST  " + best, 18, 42);
+    if (boost > 1.03) {
+      ctx.fillText("BOOST ×" + boost.toFixed(2), 18, 64);
+    }
     // 残機
     ctx.textAlign = "right";
     for (let i = 0; i < player.lives; i++) {
@@ -428,7 +568,7 @@ function drawHUD() {
     }
     ctx.font = "13px monospace";
     ctx.globalAlpha = 0.6;
-    ctx.fillText("Shift:低速  G:2D切替  +/-:立体感  P:一時停止", W - 18, 50);
+    ctx.fillText("Z:加速  Shift:低速  G:2D  +/-:立体感  P:停止", W - 18, 50);
     ctx.globalAlpha = 1;
 
     if (paused) {
@@ -445,8 +585,8 @@ function drawHUD() {
       "",
       "画面の奥から迫りくる隕石を避け続けろ！",
       "",
-      "操作: 矢印キー / WASD / ドラッグ　Shift: 低速移動",
-      "G: 3D⇔2D切替　＋/−: 立体感の調整",
+      "操作: 矢印 / WASD / ドラッグ　Z: 加速　Shift: 低速",
+      "Z加速中は速く危険だが高得点　G: 3D⇔2D　＋/−: 立体感",
     ];
     lines.forEach((t, i) => ctx.fillText(t, W / 2, H / 2 - 55 + i * 30));
     ctx.globalAlpha = 1;
@@ -475,7 +615,7 @@ function frame(now) {
   last = now;
 
   if (state === ST_PLAY && !paused) update(dt);
-  if (state !== ST_PLAY || !paused) gridScroll += meteorSpeed() * 0.6 * dt * (state === ST_PLAY ? 1 : 0.3);
+  if (state !== ST_PLAY || !paused) gridScroll += meteorSpeed() * 0.6 * dt * (state === ST_PLAY ? worldMul : 0.3);
 
   ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
   ctx.fillStyle = "#000";
