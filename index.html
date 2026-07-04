@@ -85,11 +85,11 @@ const keys = {};
 window.addEventListener("keydown", e => {
   if (["ArrowUp","ArrowDown","ArrowLeft","ArrowRight"," "].includes(e.key)) e.preventDefault();
   keys[e.key.toLowerCase()] = true;
-  if (e.key === " ") {
-    if (state !== ST_PLAY) startGame();
+  if (e.key === " " && !e.repeat) {
+    if (state === ST_PLAY) paused = !paused;
+    else startGame();
   }
   if (e.key.toLowerCase() === "g") anaglyph = !anaglyph;
-  if (e.key.toLowerCase() === "p" && state === ST_PLAY) paused = !paused;
   if (e.key === "+" || e.key === "=") EYE = Math.min(EYE + 2, 30);
   if (e.key === "-") EYE = Math.max(EYE - 2, 4);
 });
@@ -568,12 +568,12 @@ function drawHUD() {
     }
     ctx.font = "13px monospace";
     ctx.globalAlpha = 0.6;
-    ctx.fillText("Z:加速  Shift:低速  G:2D  +/-:立体感  P:停止", W - 18, 50);
+    ctx.fillText("Z:加速  Shift:低速  G:2D  +/-:立体感  Space:停止", W - 18, 50);
     ctx.globalAlpha = 1;
 
     if (paused) {
       centerText("PAUSE", 48, -20);
-      centerText("Pキーで再開", 18, 30);
+      centerText("スペースキーで再開", 18, 30);
     }
   } else if (state === ST_TITLE) {
     centerText("3D ASTEROID", 54, -130);
