@@ -72,6 +72,10 @@ const DOPAMINE_FLASH_TIME = 0.22;
 const DOPAMINE_RING_TIME = 0.55;
 const DOPAMINE_CLEAR_Z_MAX = 2800;
 const DOPAMINE_CLEAR_RADIUS_MUL = 0.9;
+const NEAR_MISS_MARGIN = 55;
+const NEAR_MISS_COOLDOWN = 0.9;
+const NEAR_MISS_RING_TIME = 0.38;
+const NEAR_MISS_CLEAR_RADIUS_MUL = 0.55;
 let state = ST_TITLE;
 let anaglyph = true;          // Gキーで2D表示に切替可能
 let paused = false;
@@ -88,6 +92,7 @@ let boostHoldTime = 0;          // Z加速を途切れずに続けている時�
 let dopamineWasActive = false;
 let dopamineFlash = 0;
 let dopamineRings = [];
+let nearMissCooldown = 0;
 const BOOST_MAX = 2.2;         // 加速時の最大倍率
 const STAR_STREAK_Z_MAX = 700; // 星の残像が奥側へ伸びる最大z距離
 const STAR_STREAK_TIME = 0.085;// 残像距離を速度へ読み替える見かけの時間幅
@@ -145,7 +150,7 @@ function startGame() {
   player.lives = 3; player.inv = 2;
   player.leanX = 0; player.leanY = 0; player.trail = [];
   boost = 1; boostHoldTime = 0; worldMul = 1;
-  dopamineWasActive = false; dopamineFlash = 0; dopamineRings = [];
+  dopamineWasActive = false; dopamineFlash = 0; dopamineRings = []; nearMissCooldown = 0;
   pointer = null;
 }
 
@@ -213,15 +218,22 @@ function targetWorldMul(vz) {
   return 1 + boostAmount() * (trailImpliedSpeed / vz);
 }
 
-function clearNearbyMeteors(x, y) {
-  const clearRadius = Math.max(limX(), limY()) * DOPAMINE_CLEAR_RADIUS_MUL;
+function clearNearbyMeteors(x, y, radiusMul = DOPAMINE_CLEAR_RADIUS_MUL, except = null) {
+  const clearRadius = Math.max(limX(), limY()) * radiusMul;
   for (let i = meteors.length - 1; i >= 0; i--) {
     const m = meteors[i];
+    if (m === except) continue;
     if (m.z > DOPAMINE_CLEAR_Z_MAX) continue;
     if (Math.hypot(m.x - x, m.y - y) > clearRadius + m.r) continue;
     explode(m.x, m.y, m.z, false);
     meteors.splice(i, 1);
   }
+}
+
+function triggerNearMissBurst(x, y, except = null) {
+  nearMissCooldown = NEAR_MISS_COOLDOWN;
+  dopamineRings.push({ x, y, z: Z0, age: 0, life: NEAR_MISS_RING_TIME, scale: 0.72 });
+  clearNearbyMeteors(x, y, NEAR_MISS_CLEAR_RADIUS_MUL, except);
 }
 
 // 機体ローカル座標 → ワールド座標（バンク・ピッチの傾きを反映）
@@ -251,6 +263,7 @@ function update(dt) {
   }
   dopamineWasActive = hotNow;
   if (dopamineFlash > 0) dopamineFlash = Math.max(0, dopamineFlash - dt);
+  if (nearMissCooldown > 0) nearMissCooldown = Math.max(0, nearMissCooldown - dt);
   for (let i = dopamineRings.length - 1; i >= 0; i--) {
     const r = dopamineRings[i];
     r.age += dt;
@@ -354,7 +367,8 @@ function update(dt) {
     if (!m.passed && m.z <= Z0 + 40) {
       m.passed = true;
       const dist = Math.hypot(m.x - player.x, m.y - player.y);
-      if (dist < m.r * 0.85 + player.r * 0.7) {
+      const hitR = m.r * 0.85 + player.r * 0.7;
+      if (dist < hitR) {
         if (player.inv <= 0) {
           player.lives--;
           player.inv = 2;
@@ -362,6 +376,7 @@ function update(dt) {
           dopamineWasActive = false;
           dopamineFlash = 0;
           dopamineRings = [];
+          nearMissCooldown = 0;
           explode(player.x, player.y, Z0, true);
           if (player.lives <= 0) {
             state = ST_OVER;
@@ -374,6 +389,9 @@ function update(dt) {
         meteors.splice(i, 1);
         continue;
       } else {
+        if (dopamineActive() && nearMissCooldown <= 0 && dist < hitR + NEAR_MISS_MARGIN) {
+          triggerNearMissBurst(player.x, player.y, m);
+        }
         if (state === ST_PLAY) score += 60 * boost * scoreMultiplier(); // 回避ボーナス（加速中は増）
       }
     }
@@ -543,12 +561,13 @@ function drawScene(d, col, dt) {
   // --- ドーパミン発動リング ---
   for (const ring of dopamineRings) {
     const t = ring.age / ring.life;
+    const scale = ring.scale || 1;
     const p = proj(ring.x, ring.y, ring.z, d);
-    const rr = (80 + 300 * t) * p.s;
+    const rr = (80 + 300 * t) * scale * p.s;
     ctx.save();
     ctx.globalCompositeOperation = "lighter";
     ctx.globalAlpha = Math.max(0, 0.65 * (1 - t));
-    ctx.lineWidth = Math.max(1.5, (8 - 5 * t) * p.s);
+    ctx.lineWidth = Math.max(1.5, (8 - 5 * t) * scale * p.s);
     ctx.shadowColor = col;
     ctx.shadowBlur = 18 * (1 - t);
     ctx.beginPath();
