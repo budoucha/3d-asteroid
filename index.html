@@ -521,7 +521,7 @@ function stopBoostSound() {
 function syncBoostSound() {
   const ac = usableAudio();
   if (!ac) return;
-  if (state === ST_PLAY && !paused && keys["z"]) {
+  if (state === ST_PLAY && !paused && boostInputActive()) {
     startBoostSound();
     if (boostSound) {
       const now = ac.currentTime;
@@ -634,6 +634,7 @@ let playTime = 0, spawnTimer = 0, shake = 0;
 let gameOverFlow = 0;          // 撃墜後に爆散と背景流れを見せる余韻
 let boost = 1;                 // 加速入力の演出・報酬倍率（1=通常、Zキーで上昇）
 let boostHoldTime = 0;          // Z加速を途切れずに続けている時間
+let boostCanceledUntilRelease = false;
 let dopamineWasActive = false;
 let dopamineFlash = 0;
 let dopamineRings = [];
@@ -675,6 +676,7 @@ function clearAllInput() {
   for (const key of Object.keys(keyboardKeys)) keyboardKeys[key] = false;
   touchKeyPointers.clear();
   for (const key of Object.keys(keys)) keys[key] = false;
+  boostCanceledUntilRelease = false;
   resetJoystick();
 }
 
@@ -867,7 +869,7 @@ function startGame() {
   player.x = 0; player.y = limY() * 0.5;
   player.lives = 3; player.inv = 2;
   player.leanX = 0; player.leanY = 0; player.trail = [];
-  boost = 1; boostHoldTime = 0; worldMul = 1;
+  boost = 1; boostHoldTime = 0; boostCanceledUntilRelease = false; worldMul = 1;
   dopamineWasActive = false; dopamineFlash = 0; dopamineRings = []; nearMissCooldown = 0;
   pointer = null;
 }
@@ -930,11 +932,23 @@ function collideBurst(x, y, z) {
 function meteorSpeed() { return Math.min(1700 + playTime * 55, 4300); }
 function spawnInterval() { return Math.max(0.5 - playTime * 0.010, 0.15); }
 function boostAmount() { return (boost - 1) / (BOOST_MAX - 1); }
-function dopamineActive() { return keys["z"] && boostHoldTime >= DOPAMINE_BOOST_TIME; }
+function boostInputActive() { return keys["z"] && !boostCanceledUntilRelease; }
+function dopamineActive() { return boostInputActive() && boostHoldTime >= DOPAMINE_BOOST_TIME; }
 function scoreMultiplier() { return dopamineActive() ? DOPAMINE_SCORE_MULT : 1; }
 function targetWorldMul(vz) {
   const trailImpliedSpeed = STAR_STREAK_Z_MAX / STAR_STREAK_TIME;
   return 1 + boostAmount() * (trailImpliedSpeed / vz);
+}
+function forceCancelBoost() {
+  boostCanceledUntilRelease = true;
+  boost = 1;
+  boostHoldTime = 0;
+  worldMul = 1;
+  dopamineWasActive = false;
+  dopamineFlash = 0;
+  dopamineRings = [];
+  nearMissCooldown = 0;
+  stopBoostSound();
 }
 
 function clearNearbyMeteors(x, y, radiusMul = DOPAMINE_CLEAR_RADIUS_MUL, except = null) {
@@ -971,10 +985,12 @@ function shipPt(mx, my, mz) {
 
 function update(dt) {
   playTime += dt;
+  if (!keys["z"]) boostCanceledUntilRelease = false;
+  const boostActive = boostInputActive();
   // 加速（ブースト）: Zキー押下で速度・出現・得点率が上昇（衝突リスクと引き換え）
-  const boostTarget = keys["z"] ? BOOST_MAX : 1;
+  const boostTarget = boostActive ? BOOST_MAX : 1;
   boost += (boostTarget - boost) * Math.min(1, dt * 6);
-  boostHoldTime = keys["z"] ? boostHoldTime + dt : 0;
+  boostHoldTime = boostActive ? boostHoldTime + dt : 0;
   const hotNow = dopamineActive();
   if (hotNow && !dopamineWasActive) {
     playSfx("dopamine");
@@ -992,7 +1008,7 @@ function update(dt) {
   }
   const vz = meteorSpeed();
   // 星の残像距離が暗示する速度に、隕石接近・グリッド流れを合わせる
-  const worldMulTarget = keys["z"] ? targetWorldMul(vz) : 1;
+  const worldMulTarget = boostActive ? targetWorldMul(vz) : 1;
   const worldEase = worldMulTarget > worldMul ? 10 : 6;
   worldMul += (worldMulTarget - worldMul) * Math.min(1, dt * worldEase);
   score += dt * 25 * boost * scoreMultiplier();
@@ -1092,15 +1108,11 @@ function update(dt) {
       const dist = Math.hypot(m.x - player.x, m.y - player.y);
       const hitR = m.r * 0.85 + player.r * 0.7;
       if (dist < hitR) {
+        if (boostInputActive() || boost > 1.01) forceCancelBoost();
         if (player.inv <= 0) {
           player.lives--;
           playSfx(player.lives <= 0 ? "gameOver" : "hit");
           player.inv = 2;
-          boostHoldTime = 0;
-          dopamineWasActive = false;
-          dopamineFlash = 0;
-          dopamineRings = [];
-          nearMissCooldown = 0;
           explode(player.x, player.y, Z0, true);
           if (player.lives <= 0) {
             state = ST_OVER;
